@@ -2,22 +2,29 @@ import numpy as np
 import heapq
 import math
 import random
+import time
+from functools import lru_cache
 from collections import deque
 from typing import List, Tuple, Optional
 
 
-def get_legal_actions(world, player):
-    directions = np.array([[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1],
-                           [-1, -1], [-1, 1], [1, -1], [1, 1]])
-    actions = []
-    for action in directions:
-        try:
-            if world[action[0] + player[0]][action[1] + player[1]] == 0:  # isn't collision
-                actions.append(action)
-        except IndexError:
-            continue  # location out of bounds
-    return actions
+directions = [  # Precomputed, reusable
+    (0, 0), (-1, 0), (1, 0), (0, -1), (0, 1),
+    (-1, -1), (-1, 1), (1, -1), (1, 1)
+]
 
+def get_legal_actions(world, player):
+    rows, cols = world.shape
+    x, y = player
+    actions = []
+
+    for dx, dy in directions:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < rows and 0 <= ny < cols:
+            if world[nx][ny] == 0:  # Valid move
+                actions.append((dx, dy))
+
+    return [np.array((dx, dy)) for dx, dy in actions]
 
 # Calculate heuristic using the diagonal distance technique
 def heuristic(start, end):
@@ -106,8 +113,8 @@ def crash(world, player):
 
 # A* Search
 def a_star(world, current, pursued):
-    start = tuple(map(int, current))
-    end = tuple(map(int, pursued))
+    start = tuple(current)
+    end = tuple(pursued)
 
     # f = g + h
     # open_set priority queue
@@ -115,24 +122,20 @@ def a_star(world, current, pursued):
     heapq.heappush(open_set, (heuristic(start, end), 0, start))
     came_from = {start: None}  # backtracking for path reconstruction
     g = {start: 0}
-    visited = set()
 
     while open_set:
         _, current_g, current_node = heapq.heappop(open_set)  # f, g, node
-
-        if current_node in visited:
-            continue
-        visited.add(current_node)
 
         if current_node == end:  # goal reached, backtrack to determine step taken
             path = []
             while current_node is not None:
                 path.append(current_node)
                 current_node = came_from[current_node]
-            path = path[::-1]  # list of nodes traveled
+            path.reverse()  # list of nodes traveled
             if len(path) > 1:
-                next_step = np.array(path[1])
-                return next_step - current  # return next step
+                dx = path[1][0] - start[0]
+                dy = path[1][1] - start[1]
+                return np.array([dx, dy])  # return next step
             else:
                 return np.array([0, 0])  # Otherwise we're at the goal, stand still
 
@@ -148,12 +151,20 @@ def a_star(world, current, pursued):
 
     return crash_direction(world, current)  # No path found
 
-import heapq
+@lru_cache(maxsize=None)  # Wrap A* with caching
+def cached_astar(player_x, player_y, target_x, target_y, state_bytes):
+    state = np.frombuffer(state_bytes, dtype=np.int32).reshape((30, 30))
+    return a_star(state, (player_x, player_y), (target_x, target_y))
+
+# Helper function to call cached A*
+def get_astar(player, target, state):
+    state_bytes = state.astype(np.int32).tobytes()
+    return cached_astar(player[0], player[1], target[0], target[1], state_bytes)
 
 # Returns the top k A* paths
-def a_star_top(world, current, goal, k=3, maximize=False):
-    start = tuple(map(int, current))
-    end = tuple(map(int, goal))
+def a_star_top(world, current, goal, k=2, maximize=False):
+    start = tuple(current)
+    end = tuple(goal)
 
     # f = g + h
     # open_set priority queue
@@ -161,20 +172,15 @@ def a_star_top(world, current, goal, k=3, maximize=False):
     heapq.heappush(open_set, (heuristic(start, end), 0, start))
     came_from = {start: None}  # backtracking for path reconstruction
     g = {start: 0}
-    visited = set()
 
     candidates = []
 
     while open_set:
         f_val, current_g, current_node = heapq.heappop(open_set)  # f, g, node
 
-        if current_node in visited:
-            continue
-        visited.add(current_node)
-
         # If this node has a previous position, we can determine the first step from start
         if came_from[current_node] is not None:
-            step_from_start = np.array(current_node) - np.array(start)
+            step_from_start = (current_node[0] - start[0], current_node[1] - start[1])
             candidates.append((f_val, step_from_start))
 
         # check where we can go next
@@ -191,6 +197,15 @@ def a_star_top(world, current, goal, k=3, maximize=False):
     sorted_candidates = sorted(candidates, key=lambda x: x[0], reverse=maximize)
 
     return [step for _, step in sorted_candidates[:k]] if sorted_candidates else [np.array([0, 0])]
+
+@lru_cache(maxsize=None)
+def cached_k_astar(start_x, start_y, goal_x, goal_y, world_bytes, k, maximize):
+    world = np.frombuffer(world_bytes, dtype=np.int32).reshape((30, 30))
+    return tuple(map(tuple, a_star_top(world, (start_x, start_y), (goal_x, goal_y), k, maximize)))
+
+def get_k_astar(world, start, goal, k=3, maximize=False):
+    world_bytes = world.astype(np.int32).tobytes()
+    return [np.array(step) for step in cached_k_astar(start[0], start[1], goal[0], goal[1], world_bytes, k, maximize)]
 
 
 def apply_pursuer(state, player, pursuer):
@@ -232,19 +247,49 @@ def apply_pursued(state, player, pursued):
 
     return apply_position(chosen_action, pursued)
 
-def simulate(node):
-    # simulate a single round with A*
+# DFS search the tree for a matching state
+def find_matching_node(root, state_key):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.state_key == state_key:
+            return node
+        stack.extend(node.children)
+    return None
 
-    # Pursued selects from the 3-best A* options
-    pursued_options = a_star_top(node.state, node.pursued, node.pursuer, k=3)
-    pursued_step = random.choice(pursued_options) if pursued_options else np.array([0, 0])
-    new_pursued = apply_position(pursued_step, node.pursued)
 
-    new_player = apply_position(a_star(node.state, node.player, new_pursued), node.player)
+def simulate(node, tree_node):
+    # Simulate a single round with A*
+    # Assume target is greedy, select randomly from k-highest A* outcomes
+    # Player selects best option for selected target location
+    # Aggressor selects the best option provided player location
+    state_key = (tuple(node.player), tuple(node.pursued), tuple(node.pursuer))
+    tree_node = find_matching_node(tree_node, state_key)
 
-    new_pursuer = apply_position(a_star(node.state, node.pursuer, new_player), node.pursuer)
+    # Check if this state has been simulated before
+    if tree_node is not None:
+        if tree_node.k_astar is None:  # Expected cached kA* but DNE
+            tree_node.k_astar = get_k_astar(node.state, node.pursued, node.pursuer, k=2, maximize=False)
 
-    return Node(node.state, new_player, new_pursued, new_pursuer)
+        new_pursued = random.choice(tree_node.k_astar)
+        for child in tree_node.children:  # Check if child exists for this simulated node
+            if np.array_equal(child.pursued, new_pursued):
+                return child  # Outcome already simulated
+
+        # Child DNE for chosen move
+        new_player = apply_position(get_astar(node.player, new_pursued, node.state), node.player)
+        new_pursuer = apply_position(get_astar(node.pursuer, new_player, node.state), node.pursuer)
+        return Node(node.state, new_player, new_pursued, new_pursuer, parent=tree_node)
+
+    # Fresh node
+    k_astar = get_k_astar(node.state, node.pursued, node.pursuer, k=2, maximize=False)
+    new_pursued = random.choice(k_astar)
+    new_player = apply_position(get_astar(node.player, new_pursued, node.state), node.player)
+    new_pursuer = apply_position(get_astar(node.pursuer, new_player, node.state), node.pursuer)
+    new_node = Node(node.state, new_player, new_pursued, new_pursuer, parent=node)
+    new_node.k_astar = k_astar
+
+    return new_node
 
 
 def UCT(child):
@@ -255,8 +300,7 @@ def UCT(child):
     return Q / N + c * math.sqrt(math.log(Np + 1) / N)
 
 # Monte Carlo Tree Search
-def mcts(state, player, pursued, pursuer):
-    root = Node(state, player, pursued, pursuer)
+def mcts(root):
     simulations = 100  # SIMULATIONS = 1 FOR TESTING ONLY
 
     for it in range(simulations):
@@ -270,13 +314,13 @@ def mcts(state, player, pursued, pursuer):
         # Expansion
         # print('expansion')
         if not check_winner(node.player, node.pursued):
-            node = node.expand()
-            if node is None:  # no expansion possible
-                continue
+            expanded = node.expand()
+            if expanded is not None:  # no expansion possible
+                node = expanded
 
         # Simulation
         # print('simulation')
-        result = node.rollout()
+        result = node.rollout(root)
 
         # Backpropagation
         # print('backpropagation')
@@ -289,7 +333,7 @@ def mcts(state, player, pursued, pursuer):
             # depth += 1
 
     chosen = root.best_child()
-    return chosen.player - player
+    return chosen.player - root.player, chosen
 
 class Node:
     def __init__(self, state, player, pursued, pursuer, parent=None):
@@ -299,6 +343,8 @@ class Node:
         self.pursuer = pursuer
         self.parent = parent
         self.children = []
+        self.state_key = (tuple(player), tuple(pursued), tuple(pursuer))
+        self.k_astar = None  # cached list of possible target positions
         self.visits = 0
         self.value = 0.0
 
@@ -366,7 +412,7 @@ class Node:
                 player.children.append(child)
                 return child
 
-    def rollout(self, max_depth=30, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
+    def rollout(self, root, max_depth=30, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
         # We simulate the game X number of turns from the current node or until we win or lose
         # We track values from these simulations so that when we backpropagate we can determine the best route
 
@@ -382,7 +428,7 @@ class Node:
             if simulation.player[0] == simulation.pursuer[0] and simulation.player[1] == simulation.pursuer[1]:
                 return -100 + step
 
-            simulation = simulate(simulation)
+            simulation = simulate(simulation, root)
 
         # smooth reward
         dist_pursued = heuristic(simulation.player, simulation.pursued)
@@ -394,7 +440,7 @@ class Node:
 
 class PlannerAgent:
     def __init__(self):
-        pass
+        self.root = None
 
     def plan_action(self, world: np.ndarray, current: np.ndarray, pursued: np.ndarray, pursuer: np.ndarray) -> Optional[
         np.ndarray]:
@@ -407,11 +453,24 @@ class PlannerAgent:
         - pursued (np.ndarray): The (row, column) coordinates of the agent to be pursued.
         - pursuer (np.ndarray): The (row, column) coordinates of the agent to evade from.
         """
+        # Continue from previous tree if possible
+        state_key = (tuple(current), tuple(pursued), tuple(pursuer))
+        if self.root is not None:
+            # Find a matching child of the previous root
+            match = [child for child in self.root.children if child.state_key == state_key]
+            if match:
+                self.root = match[0]
+            else:
+                self.root = None
+
+        # Create a new root if no continuation is found
+        if self.root is None: self.root = Node(world, current, pursued, pursuer)
 
         if heuristic(current, pursued) > 5 and heuristic(current, pursuer) > 5:
-            action = a_star(world, current, pursued)
+            action = get_astar(current, pursued, world)
         else:
-            action = mcts(world, current, pursued, pursuer)
+            action, new_root = mcts(self.root)
+            self.root = new_root
 
         '''
         CRASH CONDITION
@@ -435,7 +494,6 @@ class PlannerAgent:
                 heuristic(apply_position(action, current), pursuer)):
             return pursuer - current
 
-        # return mcts(world, current, pursued, pursuer)
         return action
         # return np.array([0, 0])
         # return crash_direction(world, current)
