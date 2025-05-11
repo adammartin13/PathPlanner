@@ -151,7 +151,7 @@ def a_star(world, current, pursued):
 
     return crash_direction(world, current)  # No path found
 
-@lru_cache(maxsize=None)  # Wrap A* with caching
+@lru_cache(maxsize=10000)  # Wrap A* with caching
 def cached_astar(player_x, player_y, target_x, target_y, state_bytes):
     state = np.frombuffer(state_bytes, dtype=np.int32).reshape((30, 30))
     return a_star(state, (player_x, player_y), (target_x, target_y))
@@ -162,7 +162,8 @@ def get_astar(player, target, state):
     return cached_astar(player[0], player[1], target[0], target[1], state_bytes)
 
 # Returns the top k A* paths
-def a_star_top(world, current, goal, k=2, maximize=False):
+def a_star_top(world, current, goal, maximize=False):
+    k = 3
     start = tuple(current)
     end = tuple(goal)
 
@@ -198,14 +199,14 @@ def a_star_top(world, current, goal, k=2, maximize=False):
 
     return [step for _, step in sorted_candidates[:k]] if sorted_candidates else [np.array([0, 0])]
 
-@lru_cache(maxsize=None)
-def cached_k_astar(start_x, start_y, goal_x, goal_y, world_bytes, k, maximize):
+@lru_cache(maxsize=10000)
+def cached_k_astar(start_x, start_y, goal_x, goal_y, world_bytes, maximize):
     world = np.frombuffer(world_bytes, dtype=np.int32).reshape((30, 30))
-    return tuple(map(tuple, a_star_top(world, (start_x, start_y), (goal_x, goal_y), k, maximize)))
+    return tuple(map(tuple, a_star_top(world, (start_x, start_y), (goal_x, goal_y), maximize)))
 
-def get_k_astar(world, start, goal, k=3, maximize=False):
+def get_k_astar(world, start, goal, maximize=False):
     world_bytes = world.astype(np.int32).tobytes()
-    return [np.array(step) for step in cached_k_astar(start[0], start[1], goal[0], goal[1], world_bytes, k, maximize)]
+    return [np.array(step) for step in cached_k_astar(start[0], start[1], goal[0], goal[1], world_bytes, maximize=False)]
 
 
 def apply_pursuer(state, player, pursuer):
@@ -269,7 +270,7 @@ def simulate(node, tree_node):
     # Check if this state has been simulated before
     if tree_node is not None:
         if tree_node.k_astar is None:  # Expected cached kA* but DNE
-            tree_node.k_astar = get_k_astar(node.state, node.pursued, node.pursuer, k=2, maximize=False)
+            tree_node.k_astar = get_k_astar(node.state, node.pursued, node.pursuer, maximize=False)
 
         new_pursued = random.choice(tree_node.k_astar)
         for child in tree_node.children:  # Check if child exists for this simulated node
@@ -282,7 +283,7 @@ def simulate(node, tree_node):
         return Node(node.state, new_player, new_pursued, new_pursuer, parent=tree_node)
 
     # Fresh node
-    k_astar = get_k_astar(node.state, node.pursued, node.pursuer, k=2, maximize=False)
+    k_astar = get_k_astar(node.state, node.pursued, node.pursuer, maximize=False)
     new_pursued = random.choice(k_astar)
     new_player = apply_position(get_astar(node.player, new_pursued, node.state), node.player)
     new_pursuer = apply_position(get_astar(node.pursuer, new_player, node.state), node.pursuer)
@@ -301,7 +302,7 @@ def UCT(child):
 
 # Monte Carlo Tree Search
 def mcts(root):
-    simulations = 100  # SIMULATIONS = 1 FOR TESTING ONLY
+    simulations = 50  # SIMULATIONS = 1 FOR TESTING ONLY
 
     for it in range(simulations):
         node = root
@@ -412,7 +413,7 @@ class Node:
                 player.children.append(child)
                 return child
 
-    def rollout(self, root, max_depth=30, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
+    def rollout(self, root, max_depth=15, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
         # We simulate the game X number of turns from the current node or until we win or lose
         # We track values from these simulations so that when we backpropagate we can determine the best route
 
