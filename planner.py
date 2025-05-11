@@ -112,7 +112,7 @@ def crash(world, player):
 
 
 # A* Search
-def a_star(world, current, pursued):
+def a_star(world, current, pursued, pursuer):
     start = tuple(current)
     end = tuple(pursued)
 
@@ -143,23 +143,25 @@ def a_star(world, current, pursued):
         for action in get_legal_actions(world, current_node):
             neighbor = (current_node[0] + action[0], current_node[1] + action[1])
             temp_g = current_g + 1
+
             if neighbor not in g or temp_g < g[neighbor]:  # best way to reach neighbor
+                danger_penalty = 5 / (heuristic(neighbor, pursuer) + 1)
                 g[neighbor] = temp_g
-                f = temp_g + heuristic(neighbor, end)
+                f = temp_g + heuristic(neighbor, end) + danger_penalty
                 heapq.heappush(open_set, (f, temp_g, neighbor))
                 came_from[neighbor] = current_node
 
     return crash_direction(world, current)  # No path found
 
 @lru_cache(maxsize=10000)  # Wrap A* with caching
-def cached_astar(player_x, player_y, target_x, target_y, state_bytes):
+def cached_astar(player_x, player_y, target_x, target_y, aggressor_x, aggressor_y, state_bytes):
     state = np.frombuffer(state_bytes, dtype=np.int32).reshape((30, 30))
-    return a_star(state, (player_x, player_y), (target_x, target_y))
+    return a_star(state, (player_x, player_y), (target_x, target_y), (aggressor_x, aggressor_y))
 
 # Helper function to call cached A*
-def get_astar(player, target, state):
+def get_astar(player, target, aggressor, state):
     state_bytes = state.astype(np.int32).tobytes()
-    return cached_astar(player[0], player[1], target[0], target[1], state_bytes)
+    return cached_astar(player[0], player[1], target[0], target[1], aggressor[0], aggressor[1], state_bytes)
 
 # Returns the top k A* paths
 def a_star_top(world, current, goal, maximize=False):
@@ -278,15 +280,15 @@ def simulate(node, tree_node):
                 return child  # Outcome already simulated
 
         # Child DNE for chosen move
-        new_player = apply_position(get_astar(node.player, new_pursued, node.state), node.player)
-        new_pursuer = apply_position(get_astar(node.pursuer, new_player, node.state), node.pursuer)
+        new_player = apply_position(get_astar(node.player, new_pursued, node.pursuer, node.state), node.player)
+        new_pursuer = apply_position(get_astar(node.pursuer, new_player, new_pursued, node.state), node.pursuer)
         return Node(node.state, new_player, new_pursued, new_pursuer, parent=tree_node)
 
     # Fresh node
     k_astar = get_k_astar(node.state, node.pursued, node.pursuer, maximize=False)
     new_pursued = random.choice(k_astar)
-    new_player = apply_position(get_astar(node.player, new_pursued, node.state), node.player)
-    new_pursuer = apply_position(get_astar(node.pursuer, new_player, node.state), node.pursuer)
+    new_player = apply_position(get_astar(node.player, new_pursued, node.pursuer, node.state), node.player)
+    new_pursuer = apply_position(get_astar(node.pursuer, new_player, new_pursued, node.state), node.pursuer)
     new_node = Node(node.state, new_player, new_pursued, new_pursuer, parent=node)
     new_node.k_astar = k_astar
 
@@ -468,7 +470,7 @@ class PlannerAgent:
         if self.root is None: self.root = Node(world, current, pursued, pursuer)
 
         if heuristic(current, pursued) > 5 and heuristic(current, pursuer) > 5:
-            action = get_astar(current, pursued, world)
+            action = get_astar(current, pursued, pursuer, world)
         else:
             action, new_root = mcts(self.root)
             self.root = new_root
