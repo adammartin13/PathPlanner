@@ -110,6 +110,20 @@ def crash(world, player):
 
     return np.array([0,0])  # no wall found
 
+# Penalty for approaching obstacles
+def obstacle_penalty(world: np.ndarray, position: Tuple[int, int], penalty_weight: float = 1.0) -> float:
+    x, y = position
+    rows, cols = world.shape
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                  (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    for dx, dy in directions:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < rows and 0 <= ny < cols:
+            if world[nx][ny] == 1:
+                return penalty_weight  # Fixed penalty for adjacency
+
+    return 0.0  # No adjacent obstacles
 
 # A* Search
 def a_star(world, current, pursued, pursuer):
@@ -146,14 +160,15 @@ def a_star(world, current, pursued, pursuer):
 
             if neighbor not in g or temp_g < g[neighbor]:  # best way to reach neighbor
                 danger_penalty = 5 / (heuristic(neighbor, pursuer) + 1)
+                obstacle = obstacle_penalty(world, neighbor, penalty_weight=2)
                 g[neighbor] = temp_g
-                f = temp_g + heuristic(neighbor, end) + danger_penalty
+                f = temp_g + heuristic(neighbor, end) + danger_penalty + obstacle
                 heapq.heappush(open_set, (f, temp_g, neighbor))
                 came_from[neighbor] = current_node
 
     return crash_direction(world, current)  # No path found
 
-@lru_cache(maxsize=10000)  # Wrap A* with caching
+@lru_cache(maxsize=5000)  # Wrap A* with caching
 def cached_astar(player_x, player_y, target_x, target_y, aggressor_x, aggressor_y, state_bytes):
     state = np.frombuffer(state_bytes, dtype=np.int32).reshape((30, 30))
     return a_star(state, (player_x, player_y), (target_x, target_y), (aggressor_x, aggressor_y))
@@ -201,7 +216,7 @@ def a_star_top(world, current, goal, maximize=False):
 
     return [step for _, step in sorted_candidates[:k]] if sorted_candidates else [np.array([0, 0])]
 
-@lru_cache(maxsize=10000)
+@lru_cache(maxsize=5000)
 def cached_k_astar(start_x, start_y, goal_x, goal_y, world_bytes, maximize):
     world = np.frombuffer(world_bytes, dtype=np.int32).reshape((30, 30))
     return tuple(map(tuple, a_star_top(world, (start_x, start_y), (goal_x, goal_y), maximize)))
@@ -305,6 +320,8 @@ def UCT(child):
 # Monte Carlo Tree Search
 def mcts(root):
     simulations = 50  # SIMULATIONS = 1 FOR TESTING ONLY
+    if heuristic(root.player, root.pursued) <= 5:
+        simulations = max(10 * heuristic(root.player, root.pursued), 10)
 
     for it in range(simulations):
         node = root
@@ -337,6 +354,7 @@ def mcts(root):
 
     chosen = root.best_child()
     return chosen.player - root.player, chosen
+
 
 class Node:
     def __init__(self, state, player, pursued, pursuer, parent=None):
@@ -415,7 +433,7 @@ class Node:
                 player.children.append(child)
                 return child
 
-    def rollout(self, root, max_depth=15, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
+    def rollout(self, root, max_depth=10, min_depth=5) -> float:  # DEPTH = 1 FOR TESTING ONLY
         # We simulate the game X number of turns from the current node or until we win or lose
         # We track values from these simulations so that when we backpropagate we can determine the best route
 
@@ -444,6 +462,9 @@ class Node:
 class PlannerAgent:
     def __init__(self):
         self.root = None
+        self.rotation = {'left':1, 'safe':1, 'right':1}  # Laplace smoothing
+        self.last_position = None
+        self.last_intended_action = None
 
     def plan_action(self, world: np.ndarray, current: np.ndarray, pursued: np.ndarray, pursuer: np.ndarray) -> Optional[
         np.ndarray]:
@@ -456,6 +477,48 @@ class PlannerAgent:
         - pursued (np.ndarray): The (row, column) coordinates of the agent to be pursued.
         - pursuer (np.ndarray): The (row, column) coordinates of the agent to evade from.
         """
+        # p-value estimation
+        # Online Bayesian Estimation with a Dirichlet Prior
+        def observe_actual_move(new_position: np.ndarray, weight=1):
+            '''
+            Combines MLE with Bayesian Estimation and prior known knowledge, called Dirichlet Prior.
+            Pi = Ni/sum_j(Nj)
+            Pi = Estimated probability for category i
+            Ni = Number of times category i was observed
+            sum_j(Nj) = The total number of actions observed
+
+            Because we combine Maximum Likelihood Estimation with laplace smoothing, we have a
+            Bayesian Estimator with a Dirichlet prior belief.
+            This means rather than just using observed frequencies, we assume p ~ Dirichlet (a1, a2, ..., ak)
+            where a_k represents the number of potential actions (in our case left, right, or no rotation).
+            '''
+            if self.last_position is None or self.last_intended_action is None:
+                return
+
+            actual_action = new_position - self.last_position
+            intended = self.last_intended_action
+
+            # Normalize for comparison: intended direction must not be (0,0)
+            if np.all(intended == 0):
+                self.last_position = None
+                self.last_intended_action = None
+                return
+
+            # Left rotation: (-y, x)
+            left = np.array([-intended[1], intended[0]])
+            right = np.array([intended[1], -intended[0]])
+
+            if np.array_equal(actual_action, intended):
+                self.rotation["safe"] += weight
+            elif np.array_equal(actual_action, left):
+                self.rotation["left"] += weight
+            elif np.array_equal(actual_action, right):
+                self.rotation["right"] += weight
+
+            self.last_position = None
+            self.last_intended_action = None
+        observe_actual_move(current)
+
         # Continue from previous tree if possible
         state_key = (tuple(current), tuple(pursued), tuple(pursuer))
         if self.root is not None:
@@ -468,6 +531,21 @@ class PlannerAgent:
 
         # Create a new root if no continuation is found
         if self.root is None: self.root = Node(world, current, pursued, pursuer)
+
+        # p-value estimation helper function
+        def get_estimated_probabilities():
+            total = sum(self.rotation.values())
+            # Compute raw probabilities
+            raw_probs = {
+                "left": self.rotation["left"],
+                "safe": self.rotation.get("safe", self.rotation.get("safe", 0)),  # compatibility
+                "right": self.rotation["right"]
+            }
+
+            # Normalize to ensure they sum to 1
+            # The sum of all prob cannot be greater than 1
+            normalized = {k: v / total for k, v in raw_probs.items()}
+            return normalized
 
         if heuristic(current, pursued) > 5 and heuristic(current, pursuer) > 5:
             action = get_astar(current, pursued, pursuer, world)
@@ -497,6 +575,13 @@ class PlannerAgent:
                 heuristic(apply_position(action, current), pursuer)):
             return pursuer - current
 
+        self.last_position = current.copy()
+        self.last_intended_action = action.copy()
+        prob = get_estimated_probabilities()
+        print('Tom prob accuracy: ' +
+              'Left: ' + str(round(abs(0.3 - prob['left']), 2)) +
+              ', Safe: ' + str(round(abs(0.3 - prob['safe']), 2)) +
+              ', Right: ' + str(round(abs(0.4 - prob['right']), 2)))
         return action
         # return np.array([0, 0])
         # return crash_direction(world, current)
